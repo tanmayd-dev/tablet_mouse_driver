@@ -15,6 +15,7 @@ sensitivity = 0.8
 scale = 0.03
 invert_x = false
 invert_y = false
+max_jump = 4000
 
 [buttons]
 pen_tip = "btn_left"

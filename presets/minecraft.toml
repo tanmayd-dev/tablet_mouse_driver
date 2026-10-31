@@ -15,12 +15,15 @@ sensitivity = 1.0
 scale = 0.04
 invert_x = false
 invert_y = false
+# Discard a single-sample coordinate spike (the kernel sometimes reports
+# (0, 0) just before the pen-lift event). 0 disables the guard.
+max_jump = 4000
 
 [buttons]
-pen_tip = "btn_left"          # attack / mine
+pen_tip = "btn_left"           # attack / mine
 pen_barrel_lower = "btn_right" # use / place
 pen_barrel_upper = "btn_middle" # pick block
-pad_0 = "wheel_up"            # hotbar previous
-pad_1 = "wheel_down"          # hotbar next
-pad_2 = "none"
-pad_3 = "none"
+pad_0 = "wheel_up"             # hotbar previous
+pad_1 = "wheel_down"           # hotbar next
+pad_2 = "toggle_passthrough"   # tap: release the pen for menus / desktop
+pad_3 = "hold_passthrough"     # hold: temporary menu mode

@@ -63,9 +63,9 @@ ungrabs the tablet before exiting.
 
 | Preset | Output | Grab pen | Buttons |
 | --- | --- | --- | --- |
-| `minecraft` | relative mouse | yes | tip LMB, lower RMB, upper MMB, ExpressKeys 0/1 wheel |
+| `minecraft` | relative mouse | yes | tip LMB, lower RMB, upper MMB, ExpressKeys 0/1 wheel, 2 toggle passthrough, 3 hold passthrough |
 | `trackmania` | Xbox 360 gamepad | no | all unbound |
-| `small-bad` | relative mouse | yes | tip LMB, lower RMB, upper MMB, ExpressKeys 0/1 wheel |
+| `small-bad` | relative mouse | yes | tip LMB, lower RMB, upper MMB, ExpressKeys 0/1 wheel, 2 toggle passthrough, 3 hold passthrough |
 | `desktop` | relative mouse | yes | tip LMB, lower RMB, upper MMB, ExpressKeys 0/1 wheel |
 
 List presets and the directories searched:
@@ -130,6 +130,7 @@ invert_x = false
 invert_y = false
 deadzone = 0.05         # rate mode only
 rate_speed = 1200.0     # rate mode only, counts per second
+max_jump = 4000         # delta mode: reject single-sample spikes; 0 disables
 
 [gamepad]
 steering_axis = "x"     # "x" | "y"
@@ -149,8 +150,8 @@ pen_barrel_lower = "btn_right"
 pen_barrel_upper = "btn_middle"
 pad_0 = "wheel_up"
 pad_1 = "wheel_down"
-pad_2 = "none"
-pad_3 = "none"
+pad_2 = "none"          # e.g. "toggle_passthrough"
+pad_3 = "none"          # e.g. "hold_passthrough"
 ```
 
 ### Actions
@@ -166,9 +167,42 @@ pad_3 = "none"
 | bumpers | `btn_tl`/`btn_shoulder_left`, `btn_tr`/`btn_shoulder_right` |
 | d-pad | `btn_dpad_up`, `btn_dpad_down`, `btn_dpad_left`, `btn_dpad_right` |
 | steering | `recenter` |
+| menu passthrough | `toggle_passthrough`, `hold_passthrough` |
 
-Aliases such as `left`, `a`, `lb`, `l3`, and `dpad_up` are accepted. Keyboard
-names are rejected on purpose.
+Aliases such as `left`, `a`, `lb`, `l3`, `dpad_up`, and `menu_mode` are
+accepted. Keyboard names are rejected on purpose.
+
+### Menu passthrough
+
+Mouse presets grab the pen so the compositor never sees absolute coordinates
+during camera look. That also means the pen cannot click Minecraft's menus or
+the desktop normally. Bind a passthrough action to an ExpressKey to release the
+grab temporarily:
+
+```toml
+[buttons]
+pad_2 = "toggle_passthrough"   # tap to enter/leave menu mode
+pad_3 = "hold_passthrough"     # hold for menu mode, release to resume
+```
+
+While passthrough is active the driver:
+
+- releases `EVIOCGRAB` so the compositor handles the pen natively;
+- stops emitting mouse/gamepad output, so the two inputs do not fight;
+- releases any virtual button that was held and centres the gamepad;
+- re-grabs the pen and resets the mouse baseline when you leave.
+
+Passthrough actions **must** be bound to an ExpressKey (`pad_0`..`pad_3`, with
+`pad_0` the first physical key). Pen events are ignored in passthrough, so a
+pen-bound toggle could not be used to leave it. The pad remains readable, which
+is why the ExpressKey still works.
+
+The toggle state is independent of the hold state. If both are active,
+passthrough stays on until both are released/toggled off.
+
+The pad is not grabbed by default (`grab_pad = false`), so the compositor may
+also see ExpressKey presses. If your compositor binds the same key, either pick
+an unbound ExpressKey or set `grab_pad = true`.
 
 ## Trackmania pedals
 
@@ -226,9 +260,20 @@ Add your user to the `input` group and log out/in:
 sudo usermod -aG input "$USER"
 ```
 
-**The camera spins or the cursor jumps when the pen is lifted.**
-Keep `grab_pen = true` for mouse presets. The driver already discards the
-kernel's `(0, 0)` coordinate packet that arrives with `BTN_TOOL_PEN=0`.
+**The camera flicks sideways or the cursor jumps when the pen is lifted.**
+Keep `grab_pen = true` for mouse presets. The driver discards the kernel's
+`(0, 0)` packet when it arrives with `BTN_TOOL_PEN=0`, and `mouse.max_jump`
+(default `4000` raw counts) rejects a spike that arrives in its own frame just
+before the lift. Lower it if flicks persist; set it to `0` to disable the guard:
+
+```sh
+tablet-driver --preset minecraft --max-jump 2000
+```
+
+If very fast flicks feel clipped, raise it instead. The Intuos M reports about
+100 counts/mm, so 4000 counts is roughly 40 mm in one sample. The baseline is
+also reset on every proximity transition and after a 50 ms sample gap, so a
+missed lift cannot produce a stale jump.
 
 **Trackmania does not see a controller.**
 The virtual pad uses the Microsoft Xbox 360 IDs (`045e:028e`) so Proton and SDL

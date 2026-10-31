@@ -20,29 +20,43 @@ use crate::output::{DryRunGamepad, DryRunMouse, GamepadSink, MouseSink, Outputs}
 /// `_IOW('E', 0x90, int)` — take exclusive ownership of an evdev node.
 const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
 
-/// Releases an `EVIOCGRAB` on drop, including on panic or early return.
+/// Owns an `EVIOCGRAB` on an evdev fd and releases it on drop, including on
+/// panic or early return. The grab can also be toggled at runtime.
 pub struct GrabGuard {
     fd: RawFd,
     active: bool,
 }
 
 impl GrabGuard {
-    pub fn new(fd: RawFd, grab: bool) -> io::Result<Option<Self>> {
-        if !grab {
-            return Ok(None);
+    pub fn new(fd: RawFd, grab: bool) -> io::Result<Self> {
+        let mut guard = Self { fd, active: false };
+        guard.set(grab)?;
+        Ok(guard)
+    }
+
+    /// Grabs or releases the device. Idempotent.
+    pub fn set(&mut self, grab: bool) -> io::Result<()> {
+        if self.active == grab {
+            return Ok(());
         }
-        let result = unsafe { libc::ioctl(fd, EVIOCGRAB, 1 as libc::c_int) };
+        let value = if grab { 1 } else { 0 };
+        let result = unsafe { libc::ioctl(self.fd, EVIOCGRAB, value as libc::c_int) };
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Some(Self { fd, active: true }))
+        self.active = grab;
+        Ok(())
+    }
+
+    pub fn is_grabbed(&self) -> bool {
+        self.active
     }
 }
 
 impl Drop for GrabGuard {
     fn drop(&mut self) {
         if self.active {
-            let _ = unsafe { libc::ioctl(self.fd, EVIOCGRAB, 0 as libc::c_int) };
+            let _ = self.set(false);
         }
     }
 }
@@ -58,6 +72,10 @@ pub struct Engine {
     actions: HashMap<InputButton, Action>,
     held: HashSet<InputButton>,
     action_counts: HashMap<Action, usize>,
+    pen_grab: Option<GrabGuard>,
+    passthrough: bool,
+    toggle_passthrough: bool,
+    hold_passthrough: bool,
     pen_in_proximity: bool,
     has_pen_tool: bool,
     last_raw_x: Option<i32>,
@@ -102,6 +120,10 @@ impl Engine {
             actions,
             held: HashSet::new(),
             action_counts: HashMap::new(),
+            pen_grab: None,
+            passthrough: false,
+            toggle_passthrough: false,
+            hold_passthrough: false,
             pen_in_proximity: !has_pen_tool,
             has_pen_tool,
             last_raw_x: None,
@@ -114,12 +136,51 @@ impl Engine {
         }
     }
 
+    /// Attaches the pen grab controller. The engine releases and re-acquires
+    /// the grab when passthrough is toggled.
+    pub fn attach_pen_grab(&mut self, grab: GrabGuard) {
+        self.pen_grab = Some(grab);
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        self.passthrough
+    }
+
     fn active(&self) -> bool {
         self.pen_in_proximity || !self.has_pen_tool
     }
 
     /// Splits a batch of events into `SYN_REPORT`-terminated frames.
+    ///
+    /// While passthrough is active the compositor owns the pen, so all pen
+    /// output is suppressed. Proximity is still tracked so re-entering the
+    /// tablet after leaving passthrough seeds the mouse baseline correctly.
     pub fn handle_batch(&mut self, events: &[InputEvent]) -> io::Result<()> {
+        if self.passthrough {
+            for event in events {
+                if event.event_type() != EventType::KEY {
+                    continue;
+                }
+                if event.code() == KeyCode::BTN_TOOL_PEN.0 {
+                    self.pen_in_proximity = event.value() != 0;
+                    continue;
+                }
+                // Some tablets expose their ExpressKeys on the pen node. Keep
+                // the passthrough controls readable there as well; everything
+                // else stays with the compositor.
+                if let Some(button) = InputButton::from_key(KeyCode::new(event.code())) {
+                    if self
+                        .actions
+                        .get(&button)
+                        .is_some_and(|action| action.is_passthrough())
+                    {
+                        self.set_button(button, event.value() != 0)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let mut start = 0;
         for (index, event) in events.iter().enumerate() {
             if event.event_type() == EventType::SYNCHRONIZATION {
@@ -328,6 +389,22 @@ impl Engine {
     }
 
     fn set_button(&mut self, button: InputButton, pressed: bool) -> io::Result<()> {
+        let Some(&action) = self.actions.get(&button) else {
+            return Ok(());
+        };
+        if action == Action::None {
+            return Ok(());
+        }
+
+        // The compositor already sees the pad and pen while passthrough is
+        // active. Only the passthrough controls themselves may act. Ignore
+        // non-passthrough buttons completely: their held state was forgotten
+        // on entry, and tracking a press that never reached the virtual device
+        // would corrupt the shared-action reference count.
+        if self.passthrough && !action.is_passthrough() {
+            return Ok(());
+        }
+
         let was_held = self.held.contains(&button);
         if pressed == was_held {
             return Ok(());
@@ -336,13 +413,6 @@ impl Engine {
             self.held.insert(button);
         } else {
             self.held.remove(&button);
-        }
-
-        let Some(&action) = self.actions.get(&button) else {
-            return Ok(());
-        };
-        if action == Action::None {
-            return Ok(());
         }
 
         if pressed {
@@ -377,7 +447,93 @@ impl Engine {
                     self.recenter()?;
                 }
             }
+            Action::TogglePassthrough => {
+                if pressed {
+                    self.toggle_passthrough = !self.toggle_passthrough;
+                    self.update_passthrough()?;
+                }
+            }
+            Action::HoldPassthrough => {
+                self.hold_passthrough = pressed;
+                self.update_passthrough()?;
+            }
         }
+        Ok(())
+    }
+
+    /// Reconciles the requested passthrough state with the pen grab and the
+    /// virtual outputs. Passthrough releases every virtual button so a held
+    /// click cannot leak into the menu, and resets the mouse baseline so the
+    /// first pen sample after resuming only seeds.
+    fn update_passthrough(&mut self) -> io::Result<()> {
+        let want = self.toggle_passthrough || self.hold_passthrough;
+        if want == self.passthrough {
+            return Ok(());
+        }
+
+        if let Some(grab) = &mut self.pen_grab {
+            let target = !want && self.config.general.grab_pen;
+            grab.set(target).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot {} pen grab: {error}",
+                        if target { "re-acquire" } else { "release" }
+                    ),
+                )
+            })?;
+        }
+        self.passthrough = want;
+
+        if want {
+            log::info!("Passthrough on: pen released to the compositor");
+            self.release_outputs()?;
+            self.forget_non_passthrough_holds();
+            self.mouse.reset();
+            self.mouse.set_proximity(false);
+        } else {
+            log::info!("Passthrough off: pen grabbed for game input");
+            self.mouse.reset();
+            self.mouse.set_proximity(self.pen_in_proximity);
+        }
+        Ok(())
+    }
+
+    /// Pen events are ignored in passthrough, so a pen button that was held
+    /// when passthrough began would otherwise stay in `held` forever and eat
+    /// the next press. Keep only the passthrough controls, whose release still
+    /// has to be observed.
+    fn forget_non_passthrough_holds(&mut self) {
+        let passthrough_inputs: HashSet<InputButton> = self
+            .actions
+            .iter()
+            .filter(|(_, action)| action.is_passthrough())
+            .map(|(input, _)| *input)
+            .collect();
+        self.held.retain(|input| passthrough_inputs.contains(input));
+    }
+
+    /// Releases mouse/gamepad buttons without touching the passthrough state.
+    fn release_outputs(&mut self) -> io::Result<()> {
+        let actions: Vec<Action> = self.action_counts.keys().copied().collect();
+        for action in actions {
+            if action.is_passthrough() {
+                continue;
+            }
+            let count = self.action_counts.get(&action).copied().unwrap_or(0);
+            if count == 0 {
+                continue;
+            }
+            if let Some(count) = self.action_counts.get_mut(&action) {
+                *count = 0;
+            }
+            self.dispatch(action, false)?;
+        }
+        self.outputs.neutral()?;
+        self.last_steering = Some(0);
+        self.last_throttle = Some(0);
+        self.last_brake = Some(0);
+        self.last_combined = Some(0);
         Ok(())
     }
 
@@ -419,6 +575,11 @@ impl Engine {
     pub fn neutral(&mut self) -> io::Result<()> {
         let actions: Vec<Action> = self.action_counts.keys().copied().collect();
         for action in actions {
+            // Do not re-grab the pen on shutdown just because a hold-to-
+            // passthrough button was down. Drop releases it anyway.
+            if action.is_passthrough() {
+                continue;
+            }
             if let Some(count) = self.action_counts.get_mut(&action) {
                 *count = 0;
             }
@@ -506,13 +667,14 @@ pub fn run(config: Config, dry_run: bool, term: Arc<AtomicBool>) -> Result<(), B
         pen_info.has_pen_tool,
     );
 
-    let _pen_grab = GrabGuard::new(pen.as_raw_fd(), config.general.grab_pen)?;
+    let pen_grab = GrabGuard::new(pen.as_raw_fd(), config.general.grab_pen)?;
     if config.general.grab_pen {
         log::info!("Grabbed pen device exclusively");
     }
+    engine.attach_pen_grab(pen_grab);
 
     let _pad_grab = match pad.as_ref() {
-        Some(device) => GrabGuard::new(device.as_raw_fd(), config.general.grab_pad)?,
+        Some(device) => Some(GrabGuard::new(device.as_raw_fd(), config.general.grab_pad)?),
         None => None,
     };
     if config.general.grab_pad {
@@ -963,6 +1125,372 @@ mod tests {
             .unwrap();
         engine.tick(0.1).unwrap();
         assert_eq!(mouse.snapshot().motions, vec![(100, 0)]);
+    }
+
+    #[test]
+    fn toggle_passthrough_suppresses_pen_and_resumes_with_fresh_baseline() {
+        let mut config = delta_config();
+        config.buttons.pad_2 = "toggle_passthrough".to_string();
+        let (mut engine, mouse) = mouse_engine(config);
+
+        engine
+            .handle_batch(&[
+                key(KeyCode::BTN_TOOL_PEN, 1),
+                abs(AbsoluteAxisCode::ABS_X, 1000),
+                abs(AbsoluteAxisCode::ABS_Y, 1000),
+                syn(),
+            ])
+            .unwrap();
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(engine.is_passthrough());
+
+        // Pen motion is owned by the compositor while passthrough is active.
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 2000), syn()])
+            .unwrap();
+        assert!(mouse.snapshot().motions.is_empty());
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(!engine.is_passthrough());
+
+        // The first sample after resuming only seeds the baseline.
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 3000), syn()])
+            .unwrap();
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 3010), syn()])
+            .unwrap();
+        assert_eq!(mouse.snapshot().motions, vec![(10, 0)]);
+    }
+
+    #[test]
+    fn hold_passthrough_ends_when_the_button_is_released() {
+        let mut config = delta_config();
+        config.buttons.pad_3 = "hold_passthrough".to_string();
+        let (mut engine, mouse) = mouse_engine(config);
+
+        engine
+            .handle_batch(&[
+                key(KeyCode::BTN_TOOL_PEN, 1),
+                abs(AbsoluteAxisCode::ABS_X, 1000),
+                syn(),
+            ])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_3, 1), syn()])
+            .unwrap();
+        assert!(engine.is_passthrough());
+
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 2000), syn()])
+            .unwrap();
+        assert!(mouse.snapshot().motions.is_empty());
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_3, 0), syn()])
+            .unwrap();
+        assert!(!engine.is_passthrough());
+
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 3000), syn()])
+            .unwrap();
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 3010), syn()])
+            .unwrap();
+        assert_eq!(mouse.snapshot().motions, vec![(10, 0)]);
+    }
+
+    #[test]
+    fn entering_passthrough_releases_held_mouse_buttons() {
+        let mut config = delta_config();
+        config.buttons.pad_2 = "toggle_passthrough".to_string();
+        let (mut engine, mouse) = mouse_engine(config);
+
+        engine
+            .handle_batch(&[
+                key(KeyCode::BTN_TOOL_PEN, 1),
+                key(KeyCode::BTN_TOUCH, 1),
+                syn(),
+            ])
+            .unwrap();
+        assert_eq!(
+            mouse.snapshot().buttons.last(),
+            Some(&(crate::action::MouseButton::Left, true))
+        );
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        assert_eq!(
+            mouse.snapshot().buttons.last(),
+            Some(&(crate::action::MouseButton::Left, false))
+        );
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+    }
+
+    #[test]
+    fn pen_tip_press_after_passthrough_is_not_lost() {
+        let mut config = delta_config();
+        config.buttons.pad_2 = "toggle_passthrough".to_string();
+        let (mut engine, mouse) = mouse_engine(config);
+
+        // Hold the pen tip, then enter passthrough while it is still down.
+        engine
+            .handle_batch(&[
+                key(KeyCode::BTN_TOOL_PEN, 1),
+                key(KeyCode::BTN_TOUCH, 1),
+                syn(),
+            ])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+
+        // The lift happens while pen events are ignored.
+        engine
+            .handle_batch(&[key(KeyCode::BTN_TOUCH, 0), syn()])
+            .unwrap();
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(!engine.is_passthrough());
+
+        // A fresh tip press must not be swallowed by stale held state.
+        engine
+            .handle_batch(&[key(KeyCode::BTN_TOUCH, 1), syn()])
+            .unwrap();
+        assert_eq!(
+            mouse.snapshot().buttons.last(),
+            Some(&(crate::action::MouseButton::Left, true))
+        );
+    }
+
+    #[test]
+    fn suppressed_pad_press_does_not_corrupt_shared_action_counts() {
+        let mut config = delta_config();
+        config.buttons.pad_0 = "btn_left".to_string();
+        config.buttons.pad_1 = "btn_left".to_string();
+        config.buttons.pad_2 = "toggle_passthrough".to_string();
+        let (mut engine, mouse) = mouse_engine(config);
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(engine.is_passthrough());
+
+        // Press one of the shared-action keys while the menu owns input.
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_0, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(!engine.is_passthrough());
+
+        // A fresh press after passthrough must emit exactly one press.
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_1, 1), syn()])
+            .unwrap();
+        assert_eq!(
+            mouse.snapshot().buttons,
+            vec![(crate::action::MouseButton::Left, true)]
+        );
+
+        // Releasing the key that was pressed during passthrough must not end
+        // the click that BTN_1 started.
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_0, 0), syn()])
+            .unwrap();
+        assert_eq!(
+            mouse.snapshot().buttons,
+            vec![(crate::action::MouseButton::Left, true)]
+        );
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_1, 0), syn()])
+            .unwrap();
+        assert_eq!(
+            mouse.snapshot().buttons.last(),
+            Some(&(crate::action::MouseButton::Left, false))
+        );
+    }
+
+    #[test]
+    fn passthrough_toggle_works_from_the_pen_node() {
+        let mut config = delta_config();
+        config.buttons.pad_2 = "toggle_passthrough".to_string();
+        let (mut engine, _mouse) = mouse_engine(config);
+
+        // Some tablets expose ExpressKeys on the pen node.
+        engine
+            .handle_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(engine.is_passthrough());
+
+        engine
+            .handle_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(!engine.is_passthrough());
+    }
+
+    #[test]
+    fn passthrough_suppresses_other_pad_actions() {
+        let mut config = delta_config();
+        config.buttons.pad_2 = "toggle_passthrough".to_string();
+        let (mut engine, mouse) = mouse_engine(config);
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(engine.is_passthrough());
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_0, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_0, 0), syn()])
+            .unwrap();
+        assert!(mouse.snapshot().wheels.is_empty());
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(!engine.is_passthrough());
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_0, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_0, 0), syn()])
+            .unwrap();
+        assert_eq!(mouse.snapshot().wheels, vec![1]);
+    }
+
+    #[test]
+    fn passthrough_tracks_proximity_for_resume() {
+        let mut config = delta_config();
+        config.buttons.pad_2 = "toggle_passthrough".to_string();
+        let (mut engine, mouse) = mouse_engine(config);
+
+        // Enter passthrough while the pen is out of proximity.
+        engine
+            .handle_batch(&[key(KeyCode::BTN_TOOL_PEN, 0), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+
+        // The pen enters and moves while passthrough is active.
+        engine
+            .handle_batch(&[
+                key(KeyCode::BTN_TOOL_PEN, 1),
+                abs(AbsoluteAxisCode::ABS_X, 1000),
+                syn(),
+            ])
+            .unwrap();
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 1), syn()])
+            .unwrap();
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_2, 0), syn()])
+            .unwrap();
+        assert!(!engine.is_passthrough());
+
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 2000), syn()])
+            .unwrap();
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 2010), syn()])
+            .unwrap();
+        assert_eq!(mouse.snapshot().motions, vec![(10, 0)]);
+    }
+
+    #[test]
+    fn passthrough_centers_gamepad_and_resumes() {
+        let mut config = gamepad_config();
+        config.buttons.pad_3 = "hold_passthrough".to_string();
+        let (mut engine, gamepad) = gamepad_engine(config);
+
+        engine
+            .handle_batch(&[
+                key(KeyCode::BTN_TOOL_PEN, 1),
+                abs(AbsoluteAxisCode::ABS_X, 21600),
+                syn(),
+            ])
+            .unwrap();
+        assert_eq!(
+            gamepad.snapshot().steering.last(),
+            Some(&crate::mapping::STICK_MAX)
+        );
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_3, 1), syn()])
+            .unwrap();
+        assert!(engine.is_passthrough());
+        assert_eq!(gamepad.snapshot().neutral_count, 1);
+
+        // Pen input is ignored while the menu owns it.
+        let before = gamepad.snapshot().steering.len();
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 0), syn()])
+            .unwrap();
+        assert_eq!(gamepad.snapshot().steering.len(), before);
+
+        engine
+            .handle_pad_batch(&[key(KeyCode::BTN_3, 0), syn()])
+            .unwrap();
+        assert!(!engine.is_passthrough());
+
+        // The neutral reset forces the same position to be emitted again.
+        engine
+            .handle_batch(&[abs(AbsoluteAxisCode::ABS_X, 21600), syn()])
+            .unwrap();
+        assert_eq!(
+            gamepad.snapshot().steering.last(),
+            Some(&crate::mapping::STICK_MAX)
+        );
     }
 
     #[test]

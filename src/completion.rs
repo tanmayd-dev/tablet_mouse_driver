@@ -49,6 +49,7 @@ _tablet_driver_run_options() {
     '--scheme[Mouse motion scheme]:scheme:(delta rate)' \
     '--sensitivity[Mouse sensitivity multiplier]:factor:' \
     '--scale[Raw tablet counts to mouse counts]:factor:' \
+    '--max-jump[Reject single-sample coordinate jumps above this]:counts:' \
     '--invert-x[Invert horizontal mouse motion]' \
     '--invert-y[Invert vertical mouse motion]' \
     '--grab[Grab the pen device exclusively]' \
@@ -178,6 +179,7 @@ mod tests {
         assert!(ZSH_SCRIPT.contains("tablet-driver presets --plain"));
         assert!(ZSH_SCRIPT.contains("_tablet_driver \"$@\""));
         assert!(ZSH_SCRIPT.contains("--no-pedals"));
+        assert!(ZSH_SCRIPT.contains("--max-jump"));
     }
 
     #[test]

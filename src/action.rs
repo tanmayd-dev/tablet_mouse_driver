@@ -49,6 +49,11 @@ impl InputButton {
         }
     }
 
+    /// Whether this is one of the ExpressKey pad buttons.
+    pub fn is_pad(self) -> bool {
+        matches!(self, Self::Pad0 | Self::Pad1 | Self::Pad2 | Self::Pad3)
+    }
+
     /// Configuration field name used in `[buttons]`.
     pub fn field_name(self) -> &'static str {
         match self {
@@ -104,6 +109,11 @@ pub enum Action {
     /// Re-anchor steering at the current pen position (or reset to the
     /// configured centre when the pen is lifted).
     Recenter,
+    /// Release the pen grab so the compositor handles it natively. Pressing
+    /// again resumes game input. Bind to an ExpressKey (`pad_0..pad_3`).
+    TogglePassthrough,
+    /// Like [`Self::TogglePassthrough`], but only while the button is held.
+    HoldPassthrough,
 }
 
 impl Action {
@@ -147,12 +157,17 @@ impl Action {
 
             "recenter" | "centre" | "center" | "reset" => Self::Recenter,
 
+            "toggle_passthrough" | "toggle_grab" | "passthrough" | "menu_mode" => {
+                Self::TogglePassthrough
+            }
+            "hold_passthrough" | "hold_grab" => Self::HoldPassthrough,
+
             other => {
                 return Err(format!(
                     "unknown action '{other}' (expected none, btn_left, btn_right, \
                      btn_middle, wheel_up, wheel_down, btn_a..btn_y, btn_start, \
                      btn_select, btn_mode, btn_tl, btn_tr, btn_thumbl, btn_thumbr, \
-                     btn_dpad_*, or recenter)"
+                     btn_dpad_*, recenter, toggle_passthrough, or hold_passthrough)"
                 ))
             }
         };
@@ -165,6 +180,11 @@ impl Action {
 
     pub fn is_gamepad(self) -> bool {
         matches!(self, Self::Gamepad(_))
+    }
+
+    /// Whether this action controls the pen-grab passthrough state.
+    pub fn is_passthrough(self) -> bool {
+        matches!(self, Self::TogglePassthrough | Self::HoldPassthrough)
     }
 }
 
@@ -196,6 +216,8 @@ impl std::fmt::Display for Action {
             Self::Gamepad(GamepadButton::DpadLeft) => "btn_dpad_left",
             Self::Gamepad(GamepadButton::DpadRight) => "btn_dpad_right",
             Self::Recenter => "recenter",
+            Self::TogglePassthrough => "toggle_passthrough",
+            Self::HoldPassthrough => "hold_passthrough",
         };
         f.write_str(text)
     }
@@ -238,6 +260,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_passthrough_actions() {
+        for name in [
+            "toggle_passthrough",
+            "toggle-grab",
+            "passthrough",
+            "menu_mode",
+        ] {
+            assert_eq!(Action::parse(name), Ok(Action::TogglePassthrough), "{name}");
+        }
+        for name in ["hold_passthrough", "hold-grab"] {
+            assert_eq!(Action::parse(name), Ok(Action::HoldPassthrough), "{name}");
+        }
+        assert!(Action::TogglePassthrough.is_passthrough());
+        assert!(Action::HoldPassthrough.is_passthrough());
+        assert!(!Action::Recenter.is_passthrough());
+    }
+
+    #[test]
     fn rejects_unknown_actions() {
         assert!(Action::parse("key_space").is_err());
         assert!(Action::parse("keyboard").is_err());
@@ -258,6 +298,8 @@ mod tests {
             "btn_y",
             "btn_start",
             "recenter",
+            "toggle_passthrough",
+            "hold_passthrough",
         ] {
             let action = Action::parse(name).unwrap();
             assert_eq!(Action::parse(&action.to_string()), Ok(action));

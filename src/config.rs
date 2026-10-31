@@ -141,6 +141,11 @@ pub struct MouseConfig {
     pub deadzone: f64,
     /// Full-deflection mouse counts per second for rate mode.
     pub rate_speed: f64,
+    /// Delta scheme only: reject a single-sample raw coordinate jump larger
+    /// than this. The kernel occasionally reports `(0, 0)` before the
+    /// proximity-out event; such a spike would otherwise flick the camera.
+    /// `0` disables the guard.
+    pub max_jump: i32,
 }
 
 impl Default for MouseConfig {
@@ -153,6 +158,7 @@ impl Default for MouseConfig {
             invert_y: false,
             deadzone: 0.05,
             rate_speed: 1200.0,
+            max_jump: 4000,
         }
     }
 }
@@ -335,6 +341,9 @@ impl Config {
         if let Some(value) = args.scale {
             self.mouse.scale = value;
         }
+        if let Some(value) = args.max_jump {
+            self.mouse.max_jump = value;
+        }
         if args.invert_x {
             self.mouse.invert_x = true;
         }
@@ -416,6 +425,9 @@ impl Config {
         if m.rate_speed <= 0.0 {
             return invalid("mouse.rate_speed must be > 0.0");
         }
+        if m.max_jump < 0 {
+            return invalid("mouse.max_jump must be >= 0 (0 disables the guard)");
+        }
 
         let g = &self.gamepad;
         if !(0.0..=1.0).contains(&g.steering_center) {
@@ -437,7 +449,19 @@ impl Config {
             return invalid("gamepad.pedal_curve must be > 0.0");
         }
 
-        self.button_map()?;
+        let actions = self.button_map()?;
+        for button in InputButton::ALL {
+            // Pen events are ignored while passthrough is active, so a
+            // pen-bound toggle could never be used to leave it. ExpressKeys
+            // stay readable on the pad node.
+            if actions[&button].is_passthrough() && !button.is_pad() {
+                return invalid(&format!(
+                    "buttons.{}: passthrough actions must be bound to an ExpressKey \
+                     (pad_0..pad_3)",
+                    button.field_name()
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -506,6 +530,24 @@ mod tests {
         let mut config = Config::default();
         config.gamepad.steering_curve = -1.0;
         assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.mouse.max_jump = -1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn passthrough_actions_must_be_bound_to_the_pad() {
+        let mut config = Config::default();
+        config.buttons.pen_tip = "toggle_passthrough".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("buttons.pen_tip"));
+        assert!(err.contains("pad_0..pad_3"));
+
+        let mut config = Config::default();
+        config.buttons.pad_2 = "toggle_passthrough".to_string();
+        config.buttons.pad_3 = "hold_passthrough".to_string();
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -556,6 +598,8 @@ mod tests {
             "2.0",
             "--sensitivity",
             "1.5",
+            "--max-jump",
+            "2500",
         ]);
         let mut config = Config::default();
         config.apply_cli(&args);
@@ -563,6 +607,7 @@ mod tests {
         assert!(!config.gamepad.enable_pedals);
         assert_eq!(config.gamepad.steering_curve, 2.0);
         assert_eq!(config.mouse.sensitivity, 1.5);
+        assert_eq!(config.mouse.max_jump, 2500);
     }
 
     #[test]

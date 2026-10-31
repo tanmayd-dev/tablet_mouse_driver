@@ -76,6 +76,10 @@ pub struct RunArgs {
     #[arg(long, value_name = "FACTOR")]
     pub scale: Option<f64>,
 
+    /// Delta mode: reject single-sample coordinate jumps above this (0 disables).
+    #[arg(long, value_name = "COUNTS")]
+    pub max_jump: Option<i32>,
+
     /// Invert horizontal mouse motion.
     #[arg(long)]
     pub invert_x: bool,
@@ -227,6 +231,8 @@ mod tests {
             "--no-pedals",
             "--steering-curve",
             "1.5",
+            "--max-jump",
+            "3000",
             "--dry-run",
         ])
         .unwrap();
@@ -235,6 +241,7 @@ mod tests {
                 assert_eq!(args.preset.as_deref(), Some("trackmania"));
                 assert!(args.no_pedals);
                 assert_eq!(args.steering_curve, Some(1.5));
+                assert_eq!(args.max_jump, Some(3000));
                 assert!(args.dry_run);
             }
             other => panic!("unexpected command: {other:?}"),

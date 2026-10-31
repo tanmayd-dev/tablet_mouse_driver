@@ -15,6 +15,7 @@ sensitivity = 0.9
 scale = 0.04
 invert_x = false
 invert_y = false
+max_jump = 4000
 
 [buttons]
 pen_tip = "btn_left"           # light attack / interact
@@ -22,5 +23,5 @@ pen_barrel_lower = "btn_right" # heavy attack / shotgun
 pen_barrel_upper = "btn_middle"
 pad_0 = "wheel_up"             # zoom in
 pad_1 = "wheel_down"           # zoom out
-pad_2 = "none"
-pad_3 = "none"
+pad_2 = "toggle_passthrough"   # tap: release the pen for menus / desktop
+pad_3 = "hold_passthrough"     # hold: temporary menu mode
