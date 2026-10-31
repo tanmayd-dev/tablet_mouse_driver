@@ -1,0 +1,26 @@
+# Desktop: trackpad-style cursor movement and clicking.
+#
+# Grabs the pen so the compositor does not also receive absolute coordinates,
+# then emits relative motion from the virtual mouse.
+
+[general]
+mode = "mouse"
+grab_pen = true
+grab_pad = false
+lift_centers = true
+
+[mouse]
+scheme = "delta"
+sensitivity = 0.8
+scale = 0.03
+invert_x = false
+invert_y = false
+
+[buttons]
+pen_tip = "btn_left"
+pen_barrel_lower = "btn_right"
+pen_barrel_upper = "btn_middle"
+pad_0 = "wheel_up"
+pad_1 = "wheel_down"
+pad_2 = "none"
+pad_3 = "none"

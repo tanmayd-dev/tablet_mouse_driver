@@ -1,0 +1,39 @@
+# Trackmania (Steam / Proton): analog Xbox 360 steering.
+#
+# Throttle and brake on the tablet are OFF by default, so keyboard pedals
+# (arrows or HJKL) work untouched. Enable them with --pedals or by setting
+# enable_pedals = true, then pick a pedal_scheme:
+#   split    - upper half throttle, lower half brake
+#   pressure - stylus pressure is throttle
+#   combined - vertical position drives ABS_Y
+
+[general]
+mode = "gamepad"
+grab_pen = false
+grab_pad = false
+lift_centers = true
+
+[gamepad]
+steering_axis = "x"
+steering_center = 0.5
+steering_half_span = 0.5
+steering_deadzone = 0.04
+steering_curve = 1.3
+invert_steering = false
+enable_pedals = false
+pedal_scheme = "split"
+pedal_deadzone = 0.03
+pedal_curve = 1.0
+
+[buttons]
+# All tablet buttons are unbound by default. Examples:
+#   pen_tip = "btn_a"
+#   pad_0 = "btn_west"      # respawn
+#   pad_3 = "btn_start"     # pause
+pen_tip = "none"
+pen_barrel_lower = "none"
+pen_barrel_upper = "none"
+pad_0 = "none"
+pad_1 = "none"
+pad_2 = "none"
+pad_3 = "none"

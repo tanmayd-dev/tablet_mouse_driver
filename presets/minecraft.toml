@@ -1,0 +1,26 @@
+# Minecraft / PineconeMC: relative mouse camera look.
+#
+# The game already owns every key binding (WASD, jump, inventory, ...), so this
+# preset emits mouse events only. Tune in-game mouse sensitivity as usual.
+
+[general]
+mode = "mouse"
+grab_pen = true
+grab_pad = false
+lift_centers = true
+
+[mouse]
+scheme = "delta"
+sensitivity = 1.0
+scale = 0.04
+invert_x = false
+invert_y = false
+
+[buttons]
+pen_tip = "btn_left"          # attack / mine
+pen_barrel_lower = "btn_right" # use / place
+pen_barrel_upper = "btn_middle" # pick block
+pad_0 = "wheel_up"            # hotbar previous
+pad_1 = "wheel_down"          # hotbar next
+pad_2 = "none"
+pad_3 = "none"

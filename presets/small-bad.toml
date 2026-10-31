@@ -1,0 +1,26 @@
+# The Uncanny Return (../small_bad): relative mouse aiming.
+#
+# Hub world and 2D infiltration both read mouse deltas. Keys (J, K, Space, E,
+# WASD) stay on the keyboard; this preset only produces mouse events.
+
+[general]
+mode = "mouse"
+grab_pen = true
+grab_pad = false
+lift_centers = true
+
+[mouse]
+scheme = "delta"
+sensitivity = 0.9
+scale = 0.04
+invert_x = false
+invert_y = false
+
+[buttons]
+pen_tip = "btn_left"           # light attack / interact
+pen_barrel_lower = "btn_right" # heavy attack / shotgun
+pen_barrel_upper = "btn_middle"
+pad_0 = "wheel_up"             # zoom in
+pad_1 = "wheel_down"           # zoom out
+pad_2 = "none"
+pad_3 = "none"
